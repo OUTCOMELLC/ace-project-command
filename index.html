@@ -150,13 +150,22 @@ const stageName = c => (stages.find(s=>s.code===c)||{}).name || c;
 async function boot(){
   const { data:{ session } } = await sb.auth.getSession();
   session ? enter(session) : leave();
-  sb.auth.onAuthStateChange((_e, s) => s ? enter(s) : leave());
+  sb.auth.onAuthStateChange((evt, s) => {
+    // never run database calls inside this callback (it can freeze the sign-in library), and ignore routine refresh events
+    setTimeout(() => {
+      if(!s) leave();
+      else if(evt !== "TOKEN_REFRESHED" && enteredFor !== s.user.id) enter(s);
+    }, 0);
+  });
 }
-function leave(){ $("#auth").classList.remove("hide"); $("#app").classList.add("hide"); $("#signout").classList.add("hide"); $("#who").textContent=""; }
+let enteredFor = null, renderSeq = 0;
+function leave(){ enteredFor=null; renderSeq++; closeModal(); $("#auth").classList.remove("hide"); $("#app").classList.add("hide"); $("#signout").classList.add("hide"); $("#who").textContent=""; }
 async function enter(session){
   $("#auth").classList.add("hide"); $("#app").classList.remove("hide"); $("#signout").classList.remove("hide");
   $("#who").textContent = session.user.email;
-  await loadRef(); render();
+  enteredFor = session.user.id;
+  try{ await loadRef(); }catch(e){ console.error(e); }
+  render();
 }
 $("#login").onclick = async () => {
   $("#authmsg").textContent = "";
@@ -169,7 +178,7 @@ $("#signup").onclick = async () => {
   if(error) $("#authmsg").textContent = error.message;
   else if(!data.session) $("#authmsg").textContent = "Account created. Check your email to confirm, then sign in.";
 };
-$("#signout").onclick = () => sb.auth.signOut();
+$("#signout").onclick = () => { leave(); sb.auth.signOut({ scope:"local" }).catch(()=>{}); };
 
 /* ---------- data ---------- */
 async function loadRef(){
@@ -185,11 +194,13 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   render();
 });
 async function render(){
+  const my = ++renderSeq;
+  $("#panel").innerHTML = `<p class="muted" style="padding:24px 4px">Loading…</p>`;
   try{
     if(tab==="week") await renderWeek();
-    else if(tab==="board") renderBoard();
-    else renderPeople();
+    else { await loadRef(); if(my !== renderSeq) return; if(tab==="board") renderBoard(); else renderPeople(); }
   }catch(e){
+    if(my !== renderSeq) return;
     console.error(e);
     $("#panel").innerHTML = `<h2 style="font-size:18px">This screen could not load</h2>
       <p style="margin:8px 0;color:#8a1f17">${esc(e && e.message ? e.message : e)}</p>
@@ -280,14 +291,127 @@ function drawTiles(rows){
   return `<div class="tiles">${tiles}</div>`;
 }
 
+/* ---------- spreadsheet import ---------- */
+const IMPORT_COLS = ["project_code","name","customer","equipment_type","contract_value","owner","stage","status","start_date","target_delivery_date","notes"];
+const COL_ALIASES = {
+  project_code:["project code","project number","project no","project #","job","job number","job no","job #","code","id"],
+  name:["project name","description","title","machine","equipment"],
+  customer:["client","customer name"],
+  equipment_type:["equipment type","machine type","type"],
+  contract_value:["contract value","value","price","amount","contract","po value"],
+  owner:["project manager","pm","manager","lead","responsible"],
+  stage:["phase","stage name"],
+  status:["health","ryg","state"],
+  start_date:["start","start date","kickoff","order date"],
+  target_delivery_date:["target delivery","target date","target","due date","due","delivery","delivery date","ship date","promise date"],
+  notes:["note","comments","comment"]
+};
+function parseCSV(text){
+  text = text.replace(/^﻿/,"");
+  const rows=[]; let row=[], cur="", q=false;
+  for(let i=0;i<text.length;i++){
+    const c=text[i];
+    if(q){ if(c==='"'){ if(text[i+1]==='"'){cur+='"';i++;} else q=false; } else cur+=c; }
+    else if(c==='"') q=true;
+    else if(c===","){ row.push(cur); cur=""; }
+    else if(c==="\n"||c==="\r"){ if(c==="\r"&&text[i+1]==="\n") i++; row.push(cur); cur=""; if(row.some(x=>x.trim()!=="")) rows.push(row); row=[]; }
+    else cur+=c;
+  }
+  row.push(cur); if(row.some(x=>x.trim()!=="")) rows.push(row);
+  return rows;
+}
+const normH = h => String(h||"").trim().toLowerCase().replace(/[_\-]+/g," ").replace(/\s+/g," ");
+function mapHeaders(hdr){
+  const map={}; 
+  hdr.forEach((h,i)=>{
+    const n=normH(h);
+    for(const col of IMPORT_COLS){
+      if(map[col]!=null) continue;
+      if(n===normH(col) || (COL_ALIASES[col]||[]).includes(n)){ map[col]=i; break; }
+    }
+  });
+  return map;
+}
+function toISODate(v){
+  v=String(v||"").trim(); if(!v) return {ok:true,val:null};
+  let m=v.match(/^(\d{4})-(\d{1,2})-(\d{1,2})$/);
+  if(!m){ const u=v.match(/^(\d{1,2})\/(\d{1,2})\/(\d{2,4})$/); if(u){ let y=+u[3]; if(y<100) y+=2000; m=[0,y,u[1],u[2]]; } }
+  if(!m) return {ok:false,val:null};
+  const y=+m[1], mo=+m[2], d=+m[3], dt=new Date(Date.UTC(y,mo-1,d));
+  if(dt.getUTCFullYear()!==y||dt.getUTCMonth()!==mo-1||dt.getUTCDate()!==d) return {ok:false,val:null};
+  return {ok:true,val:`${y}-${String(mo).padStart(2,"0")}-${String(d).padStart(2,"0")}`};
+}
+const STATUS_WORDS = { green:"green","on track":"green",ok:"green",good:"green", yellow:"yellow","at risk":"yellow",risk:"yellow",watch:"yellow", red:"red",blocked:"red",late:"red",stuck:"red", gray:"gray",grey:"gray","not started":"gray",tbd:"gray" };
+async function openImport(){
+  openModal(`<button class="xbtn" onclick="closeModal()">Close</button><h2>Import projects from a spreadsheet</h2>
+    <p class="muted" style="margin:6px 0 10px">Save your spreadsheet as <b>CSV</b> (Excel: File, Save As, CSV). Column names can be loose, for example "Job number", "Target date", "PM". You see a preview first. Nothing is saved until you confirm.</p>
+    <div class="row"><input type="file" id="impfile" accept=".csv,text/csv" style="max-width:340px"><button id="imptpl">Download blank template</button></div>
+    <div id="impout"></div>`);
+  $("#imptpl").onclick = () => {
+    const blob=new Blob([IMPORT_COLS.join(",")+"\n"],{type:"text/csv"}); const a=document.createElement("a");
+    a.href=URL.createObjectURL(blob); a.download="ACE_project_import_template.csv"; a.click();
+  };
+  $("#impfile").onchange = async e => {
+    const f=e.target.files[0]; if(!f) return;
+    $("#impout").innerHTML=`<p class="muted">Reading…</p>`;
+    try{
+      const all=parseCSV(await f.text());
+      if(all.length<2) throw new Error("The file has no data rows.");
+      const map=mapHeaders(all[0]);
+      if(map.project_code==null||map.name==null) throw new Error("I could not find a project number column and a project name column. Headers found: "+all[0].join(", "));
+      const existing=must(await sb.from("projects").select("project_code")).map(r=>String(r.project_code).toLowerCase());
+      const seen=new Set(), out=[];
+      const unusedHdr = all[0].filter((h,i)=>!Object.values(map).includes(i));
+      all.slice(1).forEach((r,idx)=>{
+        const g=c=>map[c]==null?"":String(r[map[c]]||"").trim();
+        const issues=[], warns=[];
+        const code=g("project_code"), name=g("name");
+        if(!code) issues.push("no project number"); if(!name) issues.push("no name");
+        if(code){ const k=code.toLowerCase(); if(existing.includes(k)) issues.push("already in the tool"); else if(seen.has(k)) issues.push("repeated in this file"); seen.add(k); }
+        let stage="quote"; const sv=g("stage");
+        if(sv){ const st=stages.find(x=>x.code===sv.toLowerCase()||x.name.toLowerCase()===sv.toLowerCase()); if(st) stage=st.code; else warns.push(`stage "${sv}" not recognized, set to Quote`); }
+        let status="gray"; const tv=g("status");
+        if(tv){ const sw=STATUS_WORDS[tv.toLowerCase()]; if(sw) status=sw; else warns.push(`status "${tv}" not recognized, set to Not started`); }
+        let owner_id=null; const ov=g("owner");
+        if(ov){ const pe=people.find(x=>x.full_name.toLowerCase()===ov.toLowerCase())||people.find(x=>x.full_name.toLowerCase().includes(ov.toLowerCase())&&ov.length>2); if(pe) owner_id=pe.id; else warns.push(`owner "${ov}" not in People, left blank`); }
+        const sd=toISODate(g("start_date")); if(!sd.ok) warns.push("start date not understood, left blank");
+        const td=toISODate(g("target_delivery_date")); if(!td.ok) warns.push("target date not understood, left blank");
+        let cv=null; const cvs=g("contract_value");
+        if(cvs){ const n=Number(cvs.replace(/[$,\s]/g,"")); if(isFinite(n)) cv=n; else warns.push("contract value not a number, left blank"); }
+        out.push({n:idx+2,issues,warns,row:{project_code:code,name,customer:g("customer")||null,equipment_type:g("equipment_type")||null,contract_value:cv,owner_id,stage_code:stage,status,start_date:sd.val,target_delivery_date:td.val,notes:g("notes")||null},ownerText:ov});
+      });
+      const good=out.filter(o=>!o.issues.length), bad=out.length-good.length, warned=good.filter(o=>o.warns.length).length;
+      window.__imp=good.map(o=>o.row);
+      $("#impout").innerHTML=`
+        <div class="sum"><div class="chip"><span class="dot g"></span><b style="display:inline">${good.length}</b> ready</div>
+          <div class="chip"><span class="dot y"></span><b style="display:inline">${warned}</b> with notes</div>
+          <div class="chip"><span class="dot r"></span><b style="display:inline">${bad}</b> will be skipped</div></div>
+        ${unusedHdr.length?`<p class="legend">Columns not used: ${esc(unusedHdr.join(", "))}</p>`:""}
+        <div class="tbl" style="max-height:340px;overflow:auto"><table><tr><th>Row</th><th>Project</th><th>Stage</th><th>Status</th><th>Target</th><th>Check</th></tr>
+        ${out.map(o=>`<tr><td>${o.n}</td><td><b>${esc(o.row.project_code)}</b> ${esc(o.row.name)}</td><td>${esc(stageName(o.row.stage_code))}</td><td>${pill(o.row.status)}</td><td>${fmtDate(o.row.target_delivery_date)}</td>
+          <td>${o.issues.length?`<span class="late">Skipped: ${esc(o.issues.join(", "))}</span>`:(o.warns.length?`<span style="color:#9a6b00">${esc(o.warns.join("; "))}</span>`:"OK")}</td></tr>`).join("")}</table></div>
+        <div class="row" style="margin-top:12px"><button class="pri" id="impgo" ${good.length?"":"disabled"}>Import ${good.length} project${good.length===1?"":"s"}</button><span id="impmsg" class="muted"></span></div>`;
+      $("#impgo").onclick = async () => {
+        $("#impgo").disabled=true; $("#impmsg").textContent="Importing…";
+        try{
+          must(await sb.from("projects").insert(window.__imp));
+          await loadRef(); closeModal(); render(); toast(`Imported ${window.__imp.length} project${window.__imp.length===1?"":"s"}`);
+        }catch(err){ $("#impgo").disabled=false; $("#impmsg").innerHTML=`<span class="late">Could not import: ${esc(err&&err.message?err.message:err)}</span>`; }
+      };
+    }catch(err){ $("#impout").innerHTML=`<p class="late" style="margin-top:10px">${esc(err&&err.message?err.message:err)}</p>`; }
+  };
+}
+
 async function renderWeek(){
+  const my = renderSeq;
   const rows = must(await sb.from("v_leadership_week").select("*"));
+  if(my !== renderSeq) return;
   rows.sort((a,b)=> (b.is_late - a.is_late) || ((STATUS[a.status]||{}).rank - (STATUS[b.status]||{}).rank) || String(a.target_delivery_date||"9999").localeCompare(String(b.target_delivery_date||"9999")));
   const count = k => rows.filter(r=>r.status===k).length;
   const late = rows.filter(r=>r.is_late).length;
   $("#panel").innerHTML = `
     <div class="row"><h2 style="font-size:18px">Leadership week</h2><span class="sp"></span>
-      <button class="pri" id="newp">+ New project</button></div>
+      <button id="impb">Import spreadsheet</button><button class="pri" id="newp">+ New project</button></div>
     <div class="sum">
       <div class="chip"><b>${rows.length}</b>Active projects</div>
       <div class="chip"><b class="late">${late}</b>Late</div>
@@ -309,6 +433,7 @@ async function renderWeek(){
     </table></div>
     <p class="legend">Green on track · Yellow at risk · Red blocked · Gray not started. Late projects are listed first.</p>`;
   $("#newp").onclick = () => projectForm();
+  $("#impb").onclick = () => openImport();
   document.querySelectorAll(".tile").forEach(t => t.onclick = () => t.dataset.chart==="pareto" ? openPareto(rows) : openChart(rows, t.dataset.chart, null));
   document.querySelectorAll("tr.click").forEach(tr => tr.onclick = () => detail(tr.dataset.id));
 }
